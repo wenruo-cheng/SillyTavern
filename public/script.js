@@ -722,6 +722,18 @@ async function firstLoadInit() {
         overlayContent: initLoaderOverlay,
     });
 
+    // Keep the splash useful and expose slow startup phases in the console.
+    const startupStartedAt = performance.now();
+    const runStartupPhase = async (name, task) => {
+        splashMessage.textContent = `${t`Initializing…`} ${name}`;
+        const startedAt = performance.now();
+        try {
+            return await task();
+        } finally {
+            console.debug(`[startup] ${name}: ${(performance.now() - startedAt).toFixed(0)}ms`);
+        }
+    };
+
     registerPromptManagerMigration();
     initDomHandlers();
     initStandaloneMode();
@@ -730,10 +742,12 @@ async function firstLoadInit() {
     addDOMPurifyHooks();
     reloadMarkdownProcessor();
     applyBrowserFixes();
-    await getClientVersion();
-    await initSecrets();
-    await readSecretState();
-    await initLocales();
+    await runStartupPhase('version', getClientVersion);
+    await runStartupPhase('secrets', async () => {
+        await initSecrets();
+        await readSecretState();
+    });
+    await runStartupPhase('locales', initLocales);
     initChatUtilities();
     initDefaultSlashCommands();
     initTextGenModels();
@@ -742,24 +756,30 @@ async function firstLoadInit() {
     initKoboldSettings();
     initNovelAISettings();
     initSystemPrompts();
-    await initExtensions();
+    await runStartupPhase('extensions', initExtensions);
     initExtensionSlashCommands();
     ToolManager.initToolSlashCommands();
-    await initPresetManager();
-    await initSystemMessages();
-    await getSettings(initLoaderHandle);
-    await checkOpenRouterAuth();
+    await runStartupPhase('presets', initPresetManager);
+    await runStartupPhase('system messages', initSystemMessages);
+    await runStartupPhase('settings', () => getSettings(initLoaderHandle));
+    await runStartupPhase('OpenRouter auth', checkOpenRouterAuth);
     initKeyboard();
     initDynamicStyles();
     initTags();
     initBookmarks();
-    await getUserAvatars(true, user_avatar);
-    await getCharacters();
-    await getBackgrounds();
-    await initTokenizers();
+    // Persona migration/registering mutates shared persona state, so finish it
+    // before rendering avatars in parallel with the other independent data.
+    await runStartupPhase('personas', initPersonas);
+    await runStartupPhase('user data', async () => {
+        await Promise.all([
+            getUserAvatars(true, user_avatar),
+            getCharacters(),
+            getBackgrounds(),
+            initTokenizers(),
+        ]);
+    });
     initBackgrounds();
     initAuthorsNote();
-    await initPersonas();
     await initSlashCommandAutoComplete();
     initMacroAutoComplete();
     initWorldInfo();
@@ -782,6 +802,7 @@ async function firstLoadInit() {
     initSwipePicker();
     addDebugFunctions();
     doDailyExtensionUpdatesCheck();
+    console.debug(`[startup] total: ${(performance.now() - startupStartedAt).toFixed(0)}ms`);
     await eventSource.emit(event_types.APP_INITIALIZED);
     await initLoaderHandle.hide();
     await fixViewport();
@@ -8449,7 +8470,7 @@ export async function getPastCharacterChats(characterId = null) {
 
     const response = await fetch('/api/characters/chats', {
         method: 'POST',
-        body: JSON.stringify({ avatar_url: characters[characterId].avatar }),
+        body: JSON.stringify({ avatar_url: characters[characterId].avatar, simple: true }),
         headers: getRequestHeaders(),
     });
 

@@ -35,6 +35,10 @@ const isAndroid = process.platform === 'android';
 const useShallowCharacters = !!getConfigValue('performance.lazyLoadCharacters', false, 'boolean');
 const useDiskCache = !!getConfigValue('performance.useDiskCache', true, 'boolean');
 
+// Avoid duplicate PNG parsing when the initial character list and another
+// request ask for the same card before the first parse has completed.
+const pendingCharacterReads = new Map();
+
 class DiskCache {
     /**
      * @type {string}
@@ -50,6 +54,9 @@ class DiskCache {
 
     /** @type {import('node-persist').LocalStorage} */
     #instance;
+
+    /** @type {Promise<import('node-persist').LocalStorage>|undefined} */
+    #instancePromise;
 
     /** @type {NodeJS.Timeout} */
     #syncInterval;
@@ -105,17 +112,26 @@ class DiskCache {
             return this.#instance;
         }
 
-        this.#instance = storage.create({
-            dir: this.cachePath,
-            ttl: false,
-            forgiveParseErrors: true,
-            expiredInterval: 0,
-            // @ts-ignore
-            maxFileDescriptors: 100,
-        });
-        await this.#instance.init();
-        this.#syncInterval = setInterval(this.#syncCacheEntries.bind(this), DiskCache.SYNC_INTERVAL);
-        return this.#instance;
+        // Several cards can miss the cache at once. Share one initialization
+        // promise so they do not create and initialize node-persist repeatedly.
+        if (!this.#instancePromise) {
+            this.#instancePromise = (async () => {
+                const instance = storage.create({
+                    dir: this.cachePath,
+                    ttl: false,
+                    forgiveParseErrors: true,
+                    expiredInterval: 0,
+                    // @ts-ignore
+                    maxFileDescriptors: 100,
+                });
+                await instance.init();
+                this.#instance = instance;
+                this.#syncInterval = setInterval(this.#syncCacheEntries.bind(this), DiskCache.SYNC_INTERVAL);
+                return instance;
+            })();
+        }
+
+        return this.#instancePromise;
     }
 
     /**
@@ -183,29 +199,45 @@ async function readCharacterData(inputFile, inputFormat = 'png') {
     if (memoryCache.has(cacheKey)) {
         return memoryCache.get(cacheKey);
     }
-    if (useDiskCache) {
-        try {
-            const cache = await diskCache.instance();
-            const cachedData = await cache.getItem(cacheKey);
-            if (cachedData) {
-                return cachedData;
-            }
-        } catch (error) {
-            console.warn('Error while reading from disk cache:', error);
-        }
+
+    const pending = pendingCharacterReads.get(cacheKey);
+    if (pending) {
+        return pending;
     }
 
-    const result = await parse(inputFile, inputFormat);
-    !isAndroid && memoryCache.set(cacheKey, result);
-    if (useDiskCache) {
-        try {
-            const cache = await diskCache.instance();
-            await cache.setItem(cacheKey, result);
-        } catch (error) {
-            console.warn('Error while writing to disk cache:', error);
+    const readPromise = (async () => {
+        if (useDiskCache) {
+            try {
+                const cache = await diskCache.instance();
+                const cachedData = await cache.getItem(cacheKey);
+                if (cachedData) {
+                    !isAndroid && memoryCache.set(cacheKey, cachedData);
+                    return cachedData;
+                }
+            } catch (error) {
+                console.warn('Error while reading from disk cache:', error);
+            }
         }
+
+        const result = await parse(inputFile, inputFormat);
+        !isAndroid && memoryCache.set(cacheKey, result);
+        if (useDiskCache) {
+            try {
+                const cache = await diskCache.instance();
+                await cache.setItem(cacheKey, result);
+            } catch (error) {
+                console.warn('Error while writing to disk cache:', error);
+            }
+        }
+        return result;
+    })();
+
+    pendingCharacterReads.set(cacheKey, readPromise);
+    try {
+        return await readPromise;
+    } finally {
+        pendingCharacterReads.delete(cacheKey);
     }
-    return result;
 }
 
 /**
@@ -339,19 +371,21 @@ async function tryReadImage(imgPath, crop) {
  * @param  {string} charDir The directory where the chats are stored.
  * @return { {chatSize: number, dateLastChat: number} }         The total chat size.
  */
-const calculateChatSize = (charDir) => {
+const calculateChatSize = async (charDir) => {
     let chatSize = 0;
     let dateLastChat = 0;
 
-    if (fs.existsSync(charDir)) {
-        const chats = fs.readdirSync(charDir);
-        if (Array.isArray(chats) && chats.length) {
-            for (const chat of chats) {
-                const chatStat = fs.statSync(path.join(charDir, chat));
-                chatSize += chatStat.size;
-                dateLastChat = Math.max(dateLastChat, chatStat.mtimeMs);
-            }
+    try {
+        const chats = await fsPromises.readdir(charDir, { withFileTypes: true });
+        const stats = await Promise.all(chats
+            .filter(chat => chat.isFile())
+            .map(chat => fsPromises.stat(path.join(charDir, chat.name))));
+        for (const chatStat of stats) {
+            chatSize += chatStat.size;
+            dateLastChat = Math.max(dateLastChat, chatStat.mtimeMs);
         }
+    } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
     }
 
     return { chatSize, dateLastChat };
@@ -413,12 +447,12 @@ const processCharacter = async (item, directories, { shallow }) => {
         jsonObject.avatar = item;
         const character = jsonObject;
         character.json_data = imgData;
-        const charStat = fs.statSync(path.join(directories.characters, item));
+        const charStat = await fsPromises.stat(path.join(directories.characters, item));
         character.date_added = charStat.ctimeMs;
         character.create_date = jsonObject.create_date || new Date(Math.round(charStat.ctimeMs)).toISOString();
         const chatsDirectory = path.join(directories.chats, item.replace('.png', ''));
 
-        const { chatSize, dateLastChat } = calculateChatSize(chatsDirectory);
+        const { chatSize, dateLastChat } = await calculateChatSize(chatsDirectory);
         character.chat_size = chatSize;
         character.date_last_chat = dateLastChat;
         character.data_size = calculateDataSize(jsonObject?.data);
@@ -1344,8 +1378,8 @@ router.post('/merge-attributes', getFileNameValidationFunction('avatar'), async 
                 targetAvatars = avatars;
             } else {
                 // Empty array → scan all characters in the directory
-                const files = fs.readdirSync(request.user.directories.characters);
-                targetAvatars = files.filter(file => path.extname(file).toLowerCase() === '.png');
+                const files = await fsPromises.readdir(request.user.directories.characters, { withFileTypes: true });
+                targetAvatars = files.filter(file => file.isFile() && path.extname(file.name).toLowerCase() === '.png').map(file => file.name);
             }
 
             const updated = [];
@@ -1422,11 +1456,13 @@ router.post('/delete', validateAvatarUrlMiddleware, async function (request, res
     }
 
     const avatarPath = path.join(request.user.directories.characters, request.body.avatar_url);
-    if (!fs.existsSync(avatarPath)) {
+    try {
+        await fsPromises.access(avatarPath);
+    } catch {
         return response.sendStatus(400);
     }
 
-    fs.unlinkSync(avatarPath);
+    await fsPromises.unlink(avatarPath);
     invalidateThumbnail(request.user.directories, 'avatar', request.body.avatar_url);
     let dir_name = (request.body.avatar_url.replace('.png', ''));
 
@@ -1437,7 +1473,7 @@ router.post('/delete', validateAvatarUrlMiddleware, async function (request, res
 
     if (request.body.delete_chats == true) {
         try {
-            await fs.promises.rm(path.join(request.user.directories.chats, sanitize(dir_name)), { recursive: true, force: true });
+            await fsPromises.rm(path.join(request.user.directories.chats, sanitize(dir_name)), { recursive: true, force: true });
         } catch (err) {
             console.error(err);
             return response.sendStatus(500);
@@ -1463,10 +1499,16 @@ router.post('/delete', validateAvatarUrlMiddleware, async function (request, res
  */
 router.post('/all', async function (request, response) {
     try {
-        const files = fs.readdirSync(request.user.directories.characters);
-        const pngFiles = files.filter(file => file.endsWith('.png'));
-        const processingPromises = pngFiles.map(file => processCharacter(file, request.user.directories, { shallow: useShallowCharacters }));
-        const data = (await Promise.all(processingPromises)).filter(c => c.name);
+        const files = await fsPromises.readdir(request.user.directories.characters, { withFileTypes: true });
+        const pngFiles = files.filter(file => file.isFile() && file.name.endsWith('.png')).map(file => file.name);
+        const data = [];
+        // Limit concurrent card reads to keep cold-cache startup responsive and
+        // avoid flooding the disk cache with hundreds of writes at once.
+        const batchSize = 16;
+        for (let i = 0; i < pngFiles.length; i += batchSize) {
+            const batch = pngFiles.slice(i, i + batchSize);
+            data.push(...(await Promise.all(batch.map(file => processCharacter(file, request.user.directories, { shallow: useShallowCharacters })))).filter(c => c.name));
+        }
         return response.send(data);
     } catch (err) {
         console.error(err);
