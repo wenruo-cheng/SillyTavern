@@ -128,7 +128,10 @@ class DiskCache {
                 this.#instance = instance;
                 this.#syncInterval = setInterval(this.#syncCacheEntries.bind(this), DiskCache.SYNC_INTERVAL);
                 return instance;
-            })();
+            })().catch(error => {
+                this.#instancePromise = undefined;
+                throw error;
+            });
         }
 
         return this.#instancePromise;
@@ -1457,30 +1460,33 @@ router.post('/delete', validateAvatarUrlMiddleware, async function (request, res
 
     const avatarPath = path.join(request.user.directories.characters, request.body.avatar_url);
     try {
-        await fsPromises.access(avatarPath);
-    } catch {
-        return response.sendStatus(400);
-    }
-
-    await fsPromises.unlink(avatarPath);
-    invalidateThumbnail(request.user.directories, 'avatar', request.body.avatar_url);
-    let dir_name = (request.body.avatar_url.replace('.png', ''));
-
-    if (!dir_name.length) {
-        console.error('Malicious dirname prevented');
-        return response.sendStatus(403);
-    }
-
-    if (request.body.delete_chats == true) {
-        try {
-            await fsPromises.rm(path.join(request.user.directories.chats, sanitize(dir_name)), { recursive: true, force: true });
-        } catch (err) {
-            console.error(err);
-            return response.sendStatus(500);
+        await fsPromises.unlink(avatarPath);
+    } catch (error) {
+        if (error.code === 'ENOENT') {
+            return response.sendStatus(400);
         }
+        console.error(error);
+        return response.sendStatus(500);
     }
 
-    return response.sendStatus(200);
+    try {
+        invalidateThumbnail(request.user.directories, 'avatar', request.body.avatar_url);
+        let dir_name = (request.body.avatar_url.replace('.png', ''));
+
+        if (!dir_name.length) {
+            console.error('Malicious dirname prevented');
+            return response.sendStatus(403);
+        }
+
+        if (request.body.delete_chats == true) {
+            await fsPromises.rm(path.join(request.user.directories.chats, sanitize(dir_name)), { recursive: true, force: true });
+        }
+
+        return response.sendStatus(200);
+    } catch (error) {
+        console.error(error);
+        return response.sendStatus(500);
+    }
 });
 
 /**
